@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .models import ScheduleRequest
 from .times import (
@@ -29,6 +30,13 @@ class Period:
     start: int
     end: int
     label: str
+
+
+@dataclass
+class CapacityWindow:
+    start: int  # UTC epoch 秒
+    end: int
+    capacity: int  # 非负整数；0 表示该时段不可占用
 
 
 @dataclass
@@ -57,6 +65,7 @@ class Normalized:
     blackouts: dict[str, list[Period]]  # team -> periods
     freezes: list[Period]
     resource_capacities: dict[str, int]  # 声明容量的资源 -> 正整数容量（未声明者按 1 处理）
+    resource_capacity_windows: dict[str, list[CapacityWindow]]  # 资源 -> 临时容量时段（已按时开始排序）
     max_solve_seconds: float
 
 
@@ -173,6 +182,44 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             continue
         resource_capacities[r] = cap
 
+    # 3b) 临时容量时段：逐段解析（含 DST 与区间合法性），容量必须为非负整数；
+    # 同一资源的时段在 UTC 轴上不得重叠（首尾相接允许，区间按左闭右开处理）。
+    capacity_windows_by_resource: dict[str, list[CapacityWindow]] = {}
+    for k, w in enumerate(req.resource_capacity_windows):
+        field = f"resource_capacity_windows[{k}]"
+        if not w.resource:
+            errors.append({"code": "empty_resource", "field": f"{field}.resource",
+                           "message": f"{field}: resource 不能为空"})
+            continue
+        parsed = parse_period(w.start, w.end, w.timezone, field)
+        if w.capacity is None or w.capacity < 0:
+            errors.append({"code": "bad_resource_capacity",
+                           "field": f"{field}.capacity",
+                           "message": f"资源 {w.resource} 的临时容量必须为非负整数"
+                                      f"（实际: {w.capacity}）；容量 0 表示该时段不可占用，"
+                                      "时段外沿用 resource_capacities（未声明按 1）"})
+        if parsed:
+            capacity_windows_by_resource.setdefault(w.resource, []).append(
+                CapacityWindow(parsed[0], parsed[1],
+                               w.capacity if w.capacity is not None else -1))
+
+    for r, windows in capacity_windows_by_resource.items():
+        windows.sort(key=lambda cw: cw.start)
+        for prev, cur in zip(windows, windows[1:]):
+            if cur.start < prev.end:
+                errors.append({
+                    "code": "overlapping_capacity_windows",
+                    "field": "resource_capacity_windows",
+                    "message": (
+                        f"资源 {r} 的临时容量时段重叠："
+                        f"[{datetime.fromtimestamp(prev.start, tz=timezone.utc).isoformat()} ~ "
+                        f"{datetime.fromtimestamp(prev.end, tz=timezone.utc).isoformat()} UTC, 容量 {prev.capacity}] 与 "
+                        f"[{datetime.fromtimestamp(cur.start, tz=timezone.utc).isoformat()} ~ "
+                        f"{datetime.fromtimestamp(cur.end, tz=timezone.utc).isoformat()} UTC, 容量 {cur.capacity}]；"
+                        "同一资源的容量时段不得重叠（首尾相接允许）"
+                    ),
+                })
+
     # 4) 依赖引用与环。
     deps: list[Dependency] = []
     for k, d in enumerate(req.dependencies):
@@ -228,6 +275,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         blackouts=blackouts,
         freezes=freezes,
         resource_capacities=resource_capacities,
+        resource_capacity_windows=capacity_windows_by_resource,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

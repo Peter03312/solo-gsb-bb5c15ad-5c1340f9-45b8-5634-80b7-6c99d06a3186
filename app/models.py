@@ -46,6 +46,18 @@ class ServiceTeamIn(BaseModel):
     team: str
 
 
+class ResourceCapacityWindowIn(BaseModel):
+    resource: str = Field(..., description="受临时容量约束的共享资源名")
+    start: str = Field(..., description="ISO 8601 时间；不带偏移量时按时区字段解析")
+    end: str
+    timezone: str = "UTC"
+    capacity: int = Field(
+        ...,
+        description="该时段内的容量（非负整数）；0 表示该时段完全不可占用；"
+                    "时段外沿用 resource_capacities，未声明基准容量仍为 1",
+    )
+
+
 class ScheduleRequest(BaseModel):
     services: list[ServiceIn]
     dependencies: list[DependencyIn] = Field(default_factory=list)
@@ -55,6 +67,12 @@ class ScheduleRequest(BaseModel):
     resource_capacities: dict[str, int] = Field(
         default_factory=dict,
         description="共享资源并行容量；未声明的资源容量为 1。同一时刻占用数不得超过容量",
+    )
+    resource_capacity_windows: list[ResourceCapacityWindowIn] = Field(
+        default_factory=list,
+        description="按资源给出的临时容量时段（开始、结束、时区、非负整数容量）；"
+                    "时段外沿用 resource_capacities，容量 0 表示该时段不可占用。"
+                    "同资源的时段不得重叠",
     )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 

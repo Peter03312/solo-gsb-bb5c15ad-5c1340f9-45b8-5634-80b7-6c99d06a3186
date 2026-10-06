@@ -7,8 +7,13 @@
   NoOverlap（占用区间 vs 缺口）。
 - 维护冻结：占用区间不得与任何冻结区间相交（部署与回滚窗口都要避开）。
 - 团队禁发：仅部署区间不得与所属团队禁发时段相交（回滚允许进入禁发期）。
-- 共享资源：同一资源任意时刻的占用数不得超过其容量（默认 1，即两两不重叠；
-  resource_capacities 可声明更大的正整数容量，允许至多容量个服务并行）。
+- 共享资源：同一资源任意时刻的占用数不得超过其**当时容量**。基准容量取
+  resource_capacities（默认 1，即两两不重叠；更大的正整数允许至多容量个服务并行）；
+  resource_capacity_windows 可按资源给出若干左闭右开的临时容量时段，时段内覆盖为
+  时段容量（非负整数，0 = 该时段完全不可占用），时段外沿用基准容量。视界按时段边界
+  切成容量恒定的小段：容量 0 段用 NoOverlap（占用 vs 固定段区间）逐用户封禁；
+  容量 1 段用“与该段相交”gate 的完整镜像做两两 NoOverlap；容量 ≥2 段把占用裁剪到
+  段内后做 AddCumulative，避免段外重叠被误计。降容时刻落在既有占用期间也须遵守。
 - 依赖：downstream.start >= upstream.start + deploy_up + gap。
 
 CP-SAT 的 NoOverlap 不接受约束级 enforcement literal，因此采用“可选镜像区间”：
@@ -108,6 +113,31 @@ def solve(norm: Normalized) -> SolveResult:
         """常量轴 [a, a+size) 上的可选固定区间。"""
         return m.new_optional_fixed_size_interval_var(m.new_constant(a), size, lit, name)
 
+    def overlap_lit(start_expr, size_expr, a: int, b: int, name: str) -> cp_model.IntVar:
+        """返回布尔变量：占用区间 [start, start+size) 与常量段 [a, b) 是否相交。
+
+        左闭右开轴上相交等价于 start < b 且 start + size > a。
+        """
+        g = m.new_bool_var(f"{name}_g")  # start < b
+        l = m.new_bool_var(f"{name}_l")  # start + size > a
+        m.add(start_expr < b).only_enforce_if(g)
+        m.add(start_expr >= b).only_enforce_if(g.negated())
+        m.add(start_expr + size_expr > a).only_enforce_if(l)
+        m.add(start_expr + size_expr <= a).only_enforce_if(l.negated())
+        ov = m.new_bool_var(f"{name}_ov")
+        m.add_bool_and(g, l).only_enforce_if(ov)
+        m.add_bool_or(g.negated(), l.negated()).only_enforce_if(ov.negated())
+        return ov
+
+    def gated_presence(lit, ov, name: str) -> cp_model.IntVar:
+        """p = lit AND ov：资源假设放松或占用与该段不相交时，镜像区间缺席。"""
+        p = m.new_bool_var(f"{name}_p")
+        m.add(p == 1).only_enforce_if([lit, ov])
+        m.add(p == 0).only_enforce_if([lit.negated(), ov])
+        m.add(p == 0).only_enforce_if([lit, ov.negated()])
+        m.add(p == 0).only_enforce_if([lit.negated(), ov.negated()])
+        return p
+
     # ---- 候选时间窗：占用区间必须整体落在窗口并集内 ----
     for sid, s in services.items():
         union = _merge_intervals([(w.start, w.end) for w in s.windows])
@@ -150,36 +180,137 @@ def solve(norm: Normalized) -> SolveResult:
                     opt_constant(p.start, p.end - p.start, lit, f"bo_p_{sid}_{p.start}"),
                 ])
 
-    # ---- 共享资源占用：同资源的并行占用数不得超过容量（每个资源一条假设） ----
-    # 未声明容量的资源按容量 1 处理（两两不重叠）；容量 C≥2 时允许至多 C 个占用并行。
+    # ---- 共享资源占用：同资源的并行占用数不得超过“当时”的容量 ----
+    # 基准容量取 resource_capacities（未声明为 1）；resource_capacity_windows 给出
+    # 若干左闭右开的临时容量时段，时段内覆盖为时段容量（允许 0 = 不可占用），
+    # 时段外沿用基准容量。把 [h0,h1) 按时段边界切成容量恒定的小段，逐段建立约束。
     resource_users: dict[str, list[str]] = {}
     for sid, s in services.items():
         for r in s.resources:
             resource_users.setdefault(r, []).append(sid)
+
     for resource, users in resource_users.items():
-        cap = norm.resource_capacities.get(resource, 1)
-        if len(users) <= cap:
-            # 用户数本就不超过容量：任何时刻都不可能超载，无需建立约束。
-            continue
-        if cap == 1:
-            message = (
-                f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
-                f"涉及: {', '.join(services[u].name for u in users)}"
+        base_cap = norm.resource_capacities.get(resource, 1)
+
+        def cap_segments() -> list[tuple[int, int, int]]:
+            """返回与 [h0,h1) 相交的 (seg_start, seg_end, capacity) 序列。
+
+            相邻且容量相同的段合并为一段（首尾相接的两个同容量临时时段、
+            或临时时段容量恰好等于基准时会出现这种情况）。
+            """
+            clipped = sorted(
+                (max(h0, w.start), min(h1, w.end), w.capacity)
+                for w in norm.resource_capacity_windows.get(resource, [])
+                if w.start < h1 and w.end > h0
             )
+            raw: list[tuple[int, int, int]] = []
+            cur, cap = h0, base_cap
+            for a, b, c in clipped:
+                if a > cur:
+                    raw.append((cur, a, cap))
+                raw.append((a, b, c))
+                cur = b
+            if cur < h1:
+                raw.append((cur, h1, cap))
+            merged: list[tuple[int, int, int]] = []
+            for a, b, c in raw:
+                if merged and merged[-1][1] == a and merged[-1][2] == c:
+                    merged[-1] = (merged[-1][0], b, c)
+                else:
+                    merged.append((a, b, c))
+            return merged
+
+        segments = cap_segments()
+        # 每一段的占用数都不超过该段容量：用户数本就不超过容量的段无需建模。
+        effective = [(a, b, c) for a, b, c in segments if c < len(users)]
+        if not effective:
+            continue
+
+        changed = [w for w in norm.resource_capacity_windows.get(resource, [])
+                   if w.capacity != base_cap and w.start < h1 and w.end > h0]
+        if not changed:
+            # 临时时段容量都与基准相同（例如基准 2、时段也写 2）：沿用基准容量措辞。
+            if base_cap == 1:
+                message = (
+                    f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
+                    f"涉及: {', '.join(services[u].name for u in users)}"
+                )
+            else:
+                message = (
+                    f"共享资源 {resource} 的并行容量为 {base_cap}（部署+回滚窗口内任意时刻"
+                    f"至多 {base_cap} 个服务占用），但共有 {len(users)} 个服务需要占用: "
+                    f"{', '.join(services[u].name for u in users)}；超出容量的服务必须错峰"
+                )
         else:
+            detail = "；".join(
+                f"{_iso(max(h0, w.start))} ~ {_iso(min(h1, w.end))} UTC "
+                f"容量 {w.capacity}" + ("（该时段不可占用）" if w.capacity == 0 else "")
+                for w in sorted(changed, key=lambda cw: cw.start)
+            )
             message = (
-                f"共享资源 {resource} 的并行容量为 {cap}（部署+回滚窗口内任意时刻至多 {cap} 个服务占用），"
-                f"但共有 {len(users)} 个服务需要占用: {', '.join(services[u].name for u in users)}；"
-                f"超出容量的服务必须错峰"
+                f"共享资源 {resource} 的容量随时段变化（基准 {base_cap}，未声明时段按基准）：{detail}；"
+                f"部署+回滚窗口内任意时刻的占用数不得超过当时容量，共有 {len(users)} 个服务需要占用: "
+                f"{', '.join(services[u].name for u in users)}；超出容量（含容量 0 时段）时必须错峰"
             )
         lit = new_assumption(f"resource:{resource}", message)
-        mirrors = [opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users]
-        if cap == 1:
-            m.add_no_overlap(mirrors)
-        else:
-            # 每个占用对资源的需求为 1；可选区间在 lit 为假时缺席、需求自动归零，
-            # 因此不可行核可以像 NoOverlap 一样直接定位到该资源假设。
-            m.add_cumulative(mirrors, [1] * len(mirrors), cap)
+
+        for a, b, cap in effective:
+            if cap == 0:
+                # 该时段完全不可占用：每个占用区间（gate：与该段相交时才出席）都与
+                # 固定段区间互斥。逐用户独立约束即可（NoOverlap 内含固定区间），
+                # 不会额外限制两个用户彼此。
+                for u in users:
+                    ov = overlap_lit(starts[u], occupy_iv[u].size_expr(),
+                                     a, b, f"r0_{resource}_{u}_{a}")
+                    p = gated_presence(lit, ov, f"r0_{resource}_{u}_{a}")
+                    m.add_no_overlap([
+                        opt_mirror(occupy_iv[u], p, f"res0_{resource}_{u}_{a}"),
+                        opt_constant(a, b - a, p, f"res0seg_{resource}_{u}_{a}"),
+                    ])
+            elif cap == 1:
+                # 段内两两不得重叠。用完整占用区间 + “与该段相交”gate 的镜像：
+                # 两个都出席（都与该段相交）的区间若在任何位置重叠就被禁止；
+                # 只在段外重叠时至少有一方缺席，不会误杀。
+                mirrors = []
+                for u in users:
+                    ov = overlap_lit(starts[u], occupy_iv[u].size_expr(),
+                                     a, b, f"r1_{resource}_{u}_{a}")
+                    p = gated_presence(lit, ov, f"r1_{resource}_{u}_{a}")
+                    mirrors.append(
+                        opt_mirror(occupy_iv[u], p, f"res1_{resource}_{u}_{a}"))
+                m.add_no_overlap(mirrors)
+            else:
+                # cap >= 2：累计容量，必须把每个占用严格裁剪到 [a,b) 内再计数，
+                # 否则段外（基准容量可能更大）的重叠会被误算。
+                clips = []
+                for u in users:
+                    cs = m.new_int_var(a, b, f"cs_{resource}_{u}_{a}")
+                    ce = m.new_int_var(a, b, f"ce_{resource}_{u}_{a}")
+                    csz = m.new_int_var(0, b - a, f"csz_{resource}_{u}_{a}")
+                    st = starts[u]
+                    en = st + occupy_iv[u].size_expr()
+                    ov = overlap_lit(st, occupy_iv[u].size_expr(),
+                                     a, b, f"rc_{resource}_{u}_{a}")
+                    p = gated_presence(lit, ov, f"rc_{resource}_{u}_{a}")
+                    # cs = max(st, a)、ce = min(en, b)。MaxEquality/MinEquality
+                    # 不支持 enforcement literal，改用两个选择器布尔量 + 线性等式。
+                    sg = m.new_bool_var(f"csg_{resource}_{u}_{a}")  # st >= a
+                    eb = m.new_bool_var(f"ceb_{resource}_{u}_{a}")  # en <= b
+                    m.add(st >= a).only_enforce_if(sg)
+                    m.add(st < a).only_enforce_if(sg.negated())
+                    m.add(en <= b).only_enforce_if(eb)
+                    m.add(en > b).only_enforce_if(eb.negated())
+                    m.add(cs == st).only_enforce_if([ov, sg])
+                    m.add(cs == a).only_enforce_if([ov, sg.negated()])
+                    m.add(ce == en).only_enforce_if([ov, eb])
+                    m.add(ce == b).only_enforce_if([ov, eb.negated()])
+                    # 不相交时退化为点区间 [a,a)，size 0、presence 必为假。
+                    m.add(cs == a).only_enforce_if(ov.negated())
+                    m.add(ce == a).only_enforce_if(ov.negated())
+                    m.add(cs + csz == ce)
+                    clips.append(m.new_optional_interval_var(
+                        cs, csz, ce, p, f"resc_{resource}_{u}_{a}"))
+                m.add_cumulative(clips, [1] * len(clips), cap)
 
     # ---- 依赖先后 + 最小间隔（线性不等式支持直接挂 literal） ----
     for d in norm.dependencies:

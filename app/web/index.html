@@ -59,6 +59,7 @@
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
       <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
+      <button class="secondary" onclick="loadScenario('throttle')">临时限流（容量时段）</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
       <button class="secondary" onclick="loadScenario('infeasible')">不可行示例</button>
     </div>
@@ -126,6 +127,28 @@ const SCENARIOS = {
     // canary-pool 容量 2：A、B 可并行占用，C 错峰一小时；
     // 改成 1 则三者串行，改成 0 会以 422（bad_resource_capacity）拒绝。
     resource_capacities: { "canary-pool": 2 },
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  throttle: {
+    services: [
+      { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T04:00", timezone:"UTC"}]},
+      { id:"canary-b", name:"灰度服务 B", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T04:00", timezone:"UTC"}]},
+      { id:"canary-c", name:"灰度服务 C", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T04:00", timezone:"UTC"}]}
+    ],
+    // 基准容量 3；01:00–02:00 UTC 临时降容到 1（部署+回滚占用都计入）：
+    // 一个服务 00:00 开始（01:00 整点释放，左闭右开不进降容段），另两个 02:00 并行。
+    // 把 capacity 改成 0 即整段封禁；时段重叠/负容量/墙上时间 DST 歧义会被 422 拒绝。
+    resource_capacities: { "canary-pool": 3 },
+    resource_capacity_windows: [
+      { resource:"canary-pool", start:"2026-12-01T01:00", end:"2026-12-01T02:00",
+        timezone:"UTC", capacity:1 }
+    ],
     dependencies: [], service_teams: [], team_blackouts: [], freezes: []
   },
   dst: {
