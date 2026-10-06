@@ -8,7 +8,9 @@
 - 维护冻结：占用区间不得与任何冻结区间相交（部署与回滚窗口都要避开）。
 - 团队禁发：仅部署区间不得与所属团队禁发时段相交（回滚允许进入禁发期）。
 - 共享资源：同一资源任意时刻的占用数不得超过其容量（默认 1，即两两不重叠；
-  resource_capacities 可声明更大的正整数容量，允许至多容量个服务并行）。
+  resource_capacities 可声明更大的正整数容量，允许至多容量个服务并行；
+  resource_capacity_periods 可声明临时容量时段（左闭右开），时段内按当时容量、
+  时段外按基准容量，容量 0 表示该时段不可占用）。
 - 依赖：downstream.start >= upstream.start + deploy_up + gap。
 
 CP-SAT 的 NoOverlap 不接受约束级 enforcement literal，因此采用“可选镜像区间”：
@@ -64,6 +66,75 @@ def _complement(union: list[tuple[int, int]], h0: int, h1: int) -> list[tuple[in
     if cur < h1:
         gaps.append((cur, h1))
     return gaps
+
+
+def _capacity_message(resource: str, cap: int, users: list[str], services) -> str:
+    """基准容量约束的阻塞说明（与无临时容量时段时的措辞一致）。"""
+    if cap == 1:
+        return (
+            f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
+            f"涉及: {', '.join(services[u].name for u in users)}"
+        )
+    return (
+        f"共享资源 {resource} 的并行容量为 {cap}（部署+回滚窗口内任意时刻至多 {cap} 个服务占用），"
+        f"但共有 {len(users)} 个服务需要占用: {', '.join(services[u].name for u in users)}；"
+        f"超出容量的服务必须错峰"
+    )
+
+
+def _period_message(resource: str, period, users: list[str], services) -> str:
+    """临时容量时段约束的阻塞说明。"""
+    span = f"{_iso(period.start)} ~ {_iso(period.end)} UTC"
+    names = ", ".join(services[u].name for u in users)
+    if period.capacity == 0:
+        return (
+            f"共享资源 {resource} 在 {span} 期间临时限流为 0（不可占用）；"
+            f"涉及服务的部署+回滚窗口不得与该时段重叠: {names}"
+        )
+    return (
+        f"共享资源 {resource} 在 {span} 期间容量临时为 {period.capacity}"
+        f"（部署+回滚窗口内任意时刻至多 {period.capacity} 个服务占用）；涉及: {names}"
+    )
+
+
+def _add_segment_capacity(m: cp_model.CpModel, starts, services, users: list[str],
+                          a: int, b: int, cap: int, lit, h0: int, h1: int,
+                          prefix: str) -> None:
+    """约束：分段 [a, b) 内任意时刻的占用并发数 ≤ cap（左闭右开）。
+
+    对每个占用区间 [st, st+dur) 建“钳制到分段”的可选区间：仅当占用与分段重叠时
+    出席（ov），其区间为 [max(st,a), min(st+dur,b))。对该分段做 Cumulative(cap)
+    即等价于分段内任意时刻并发 ≤ cap；降容时刻落在既有占用期间时，该占用在分段内
+    仍有非空钳制区间，计入当时容量。lit 为假时全部钳制区间缺席，约束整体放松。
+    """
+    clamped = []
+    for u in users:
+        dur = services[u].duration + services[u].rollback
+        start = starts[u]
+        # ov ⟺ 占用与分段重叠 ⟺ st ≤ b-1 且 st ≥ a-dur+1（整数秒）
+        ge = m.new_bool_var(f"{prefix}_{u}_ge")
+        le = m.new_bool_var(f"{prefix}_{u}_le")
+        m.add(start >= a - dur + 1).only_enforce_if(ge)
+        m.add(start <= a - dur).only_enforce_if(ge.Not())
+        m.add(start <= b - 1).only_enforce_if(le)
+        m.add(start >= b).only_enforce_if(le.Not())
+        ov = m.new_bool_var(f"{prefix}_{u}_ov")
+        m.add_bool_and([ge, le]).only_enforce_if(ov)
+        m.add_bool_or([ge.Not(), le.Not()]).only_enforce_if(ov.Not())
+        # 钳制区间 [s2, s2+sz)：s2 = max(st, a)，e2 = min(st+dur, b)，sz = max(0, e2-s2)
+        s2 = m.new_int_var(h0, h1, f"{prefix}_{u}_s")
+        m.add_max_equality(s2, [start, a])
+        e2 = m.new_int_var(h0, h1, f"{prefix}_{u}_e")
+        m.add_min_equality(e2, [start + dur, b])
+        sz = m.new_int_var(0, h1 - h0, f"{prefix}_{u}_sz")
+        m.add_max_equality(sz, [e2 - s2, 0])
+        end2 = m.new_int_var(h0, h1, f"{prefix}_{u}_end")
+        m.add(end2 == s2 + sz)
+        pres = m.new_bool_var(f"{prefix}_{u}_pres")
+        m.add_multiplication_equality(pres, [ov, lit])
+        clamped.append(
+            m.new_optional_interval_var(s2, sz, end2, pres, f"{prefix}_{u}_iv"))
+    m.add_cumulative(clamped, [1] * len(clamped), cap)
 
 
 def solve(norm: Normalized) -> SolveResult:
@@ -150,36 +221,62 @@ def solve(norm: Normalized) -> SolveResult:
                     opt_constant(p.start, p.end - p.start, lit, f"bo_p_{sid}_{p.start}"),
                 ])
 
-    # ---- 共享资源占用：同资源的并行占用数不得超过容量（每个资源一条假设） ----
-    # 未声明容量的资源按容量 1 处理（两两不重叠）；容量 C≥2 时允许至多 C 个占用并行。
+    # ---- 共享资源占用：同资源任意时刻的并行占用数不得超过当时容量 ----
+    # 基准容量来自 resource_capacities（未声明为 1）；resource_capacity_periods 声明的
+    # 临时容量时段（左闭右开）在时段内覆盖基准容量，时段外仍按基准容量。
     resource_users: dict[str, list[str]] = {}
     for sid, s in services.items():
         for r in s.resources:
             resource_users.setdefault(r, []).append(sid)
     for resource, users in resource_users.items():
         cap = norm.resource_capacities.get(resource, 1)
-        if len(users) <= cap:
-            # 用户数本就不超过容量：任何时刻都不可能超载，无需建立约束。
+        periods = norm.capacity_periods.get(resource, [])
+        if not periods:
+            # 无临时容量时段：恒定容量，沿用 NoOverlap（容量 1）/ Cumulative（容量 ≥ 2）。
+            if len(users) <= cap:
+                # 用户数本就不超过容量：任何时刻都不可能超载，无需建立约束。
+                continue
+            lit = new_assumption(f"resource:{resource}",
+                                 _capacity_message(resource, cap, users, services))
+            mirrors = [opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users]
+            if cap == 1:
+                m.add_no_overlap(mirrors)
+            else:
+                # 每个占用对资源的需求为 1；可选区间在 lit 为假时缺席、需求自动归零，
+                # 因此不可行核可以像 NoOverlap 一样直接定位到该资源假设。
+                m.add_cumulative(mirrors, [1] * len(mirrors), cap)
             continue
-        if cap == 1:
-            message = (
-                f"共享资源 {resource} 同时只能被一个服务占用（部署+回滚窗口）；"
-                f"涉及: {', '.join(services[u].name for u in users)}"
-            )
-        else:
-            message = (
-                f"共享资源 {resource} 的并行容量为 {cap}（部署+回滚窗口内任意时刻至多 {cap} 个服务占用），"
-                f"但共有 {len(users)} 个服务需要占用: {', '.join(services[u].name for u in users)}；"
-                f"超出容量的服务必须错峰"
-            )
-        lit = new_assumption(f"resource:{resource}", message)
-        mirrors = [opt_mirror(occupy_iv[u], lit, f"res_{resource}_{u}") for u in users]
-        if cap == 1:
-            m.add_no_overlap(mirrors)
-        else:
-            # 每个占用对资源的需求为 1；可选区间在 lit 为假时缺席、需求自动归零，
-            # 因此不可行核可以像 NoOverlap 一样直接定位到该资源假设。
-            m.add_cumulative(mirrors, [1] * len(mirrors), cap)
+
+        # 有临时容量时段：把总时间轴按时段边界切分为若干容量恒定的分段，对每个
+        # “当时容量 < 占用服务数”的分段约束其内部任意时刻的占用并发数不超过当时容量。
+        clipped = sorted(
+            ((max(p.start, h0), min(p.end, h1), p) for p in periods
+             if max(p.start, h0) < min(p.end, h1)),
+            key=lambda t: (t[0], t[1]),
+        )
+        bounds = sorted({h0, h1} | {a for a, _, _ in clipped} | {b for _, b, _ in clipped})
+        base_lit: cp_model.IntVar | None = None
+        period_lits: dict[int, cp_model.IntVar] = {}
+        for a, b in zip(bounds, bounds[1:]):
+            covering = next((p for ca, cb, p in clipped if ca <= a and b <= cb), None)
+            seg_cap = covering.capacity if covering is not None else cap
+            if seg_cap >= len(users):
+                # 该分段内容量本就够用：任何时刻都不可能超载，无需建立约束。
+                continue
+            if covering is None:
+                if base_lit is None:
+                    base_lit = new_assumption(
+                        f"resource:{resource}",
+                        _capacity_message(resource, cap, users, services))
+                lit = base_lit
+            else:
+                if covering.start not in period_lits:
+                    period_lits[covering.start] = new_assumption(
+                        f"resource:{resource}:{covering.start}",
+                        _period_message(resource, covering, users, services))
+                lit = period_lits[covering.start]
+            _add_segment_capacity(m, starts, services, users, a, b, seg_cap, lit,
+                                  h0, h1, f"res_{resource}_{a}")
 
     # ---- 依赖先后 + 最小间隔（线性不等式支持直接挂 literal） ----
     for d in norm.dependencies:

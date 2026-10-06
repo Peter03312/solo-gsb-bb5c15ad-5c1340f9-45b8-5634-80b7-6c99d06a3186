@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .models import ScheduleRequest
 from .times import (
@@ -29,6 +30,13 @@ class Period:
     start: int
     end: int
     label: str
+
+
+@dataclass
+class CapacityPeriod:
+    start: int
+    end: int
+    capacity: int  # 非负整数；0 表示该时段内资源不可占用
 
 
 @dataclass
@@ -57,7 +65,12 @@ class Normalized:
     blackouts: dict[str, list[Period]]  # team -> periods
     freezes: list[Period]
     resource_capacities: dict[str, int]  # 声明容量的资源 -> 正整数容量（未声明者按 1 处理）
+    capacity_periods: dict[str, list[CapacityPeriod]]  # 资源 -> 临时容量时段（按开始时刻排序，互不重叠）
     max_solve_seconds: float
+
+
+def _iso(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 def _issue_error(issue: DstIssue) -> dict:
@@ -173,7 +186,38 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             continue
         resource_capacities[r] = cap
 
-    # 4) 依赖引用与环。
+    # 4) 资源临时容量时段：容量必须为非负整数（0 = 该时段不可占用）；
+    #    时段本身复用 DST/区间校验；同一资源的时段不得重叠（左闭右开，首尾相接允许）。
+    capacity_periods: dict[str, list[CapacityPeriod]] = {}
+    for i, p in enumerate(req.resource_capacity_periods):
+        field = f"resource_capacity_periods[{i}]"
+        cap_ok = True
+        if p.capacity < 0:
+            errors.append({"code": "bad_capacity_period",
+                           "field": f"{field}.capacity",
+                           "message": f"资源 {p.resource} 的容量时段容量必须为非负整数"
+                                      f"（实际: {p.capacity}）；0 表示该时段内资源不可占用"})
+            cap_ok = False
+        parsed = parse_period(p.start, p.end, p.timezone, field)
+        if cap_ok and parsed:
+            capacity_periods.setdefault(p.resource, []).append(
+                CapacityPeriod(parsed[0], parsed[1], p.capacity))
+    for resource, plist in capacity_periods.items():
+        plist.sort(key=lambda p: (p.start, p.end))
+        for prev, cur in zip(plist, plist[1:]):
+            if cur.start < prev.end:
+                errors.append({
+                    "code": "capacity_period_overlap",
+                    "field": f"resource_capacity_periods[{resource}]",
+                    "message": (
+                        f"资源 {resource} 的容量时段重叠："
+                        f"{_iso(prev.start)} ~ {_iso(prev.end)} 与 "
+                        f"{_iso(cur.start)} ~ {_iso(cur.end)}；"
+                        "同一资源的容量时段不得重叠（首尾相接允许）"
+                    ),
+                })
+
+    # 5) 依赖引用与环。
     deps: list[Dependency] = []
     for k, d in enumerate(req.dependencies):
         field = f"dependencies[{k}]"
@@ -193,7 +237,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             errors.append({"code": "dependency_cycle", "field": "dependencies",
                            "message": "服务依赖存在环，无法定义先后顺序: " + " -> ".join(cycle)})
 
-    # 5) 团队归属与禁发。
+    # 6) 团队归属与禁发。
     team_members: dict[str, list[str]] = {}
     for m in req.service_teams:
         if m.service not in services:
@@ -211,7 +255,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             )
     # 团队没有禁发记录是合法的（表示该团队全程可发布），不报错。
 
-    # 6) 全局维护冻结。
+    # 7) 全局维护冻结。
     freezes: list[Period] = []
     for f in req.freezes:
         parsed = parse_period(f.start, f.end, f.timezone, f"freezes[{f.label}]")
@@ -228,6 +272,7 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         blackouts=blackouts,
         freezes=freezes,
         resource_capacities=resource_capacities,
+        capacity_periods=capacity_periods,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

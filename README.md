@@ -11,7 +11,7 @@
 | 依赖先后 | `下游开始 ≥ 上游部署结束 + gap_minutes` |
 | 团队禁发 | 仅**部署区间**不得与所属团队禁发时段重叠（回滚允许进入禁发期） |
 | 维护冻结 | **占用区间（部署+回滚）**不得与任何冻结重叠 |
-| 共享资源 | 同名资源在任意时刻的**占用数（含回滚窗口）**不得超过其容量。容量由请求顶层的 `resource_capacities` 声明（正整数）；**未声明的资源容量为 1**，即同一时间只能被一个服务占用。容量为 2 时两个服务可并行，第三个必须错峰 |
+| 共享资源 | 同名资源在任意时刻的**占用数（含回滚窗口）**不得超过其容量。容量由请求顶层的 `resource_capacities` 声明（正整数）；**未声明的资源容量为 1**，即同一时间只能被一个服务占用。容量为 2 时两个服务可并行，第三个必须错峰。还可用 `resource_capacity_periods` 为资源声明**临时容量时段**（开始、结束、时区、非负整数容量，左闭右开）：时段内任意时刻占用数不得超过当时容量（**0 表示该时段不可占用**），时段外沿用 `resource_capacities` 基准容量；降容时刻落在既有占用期间同样生效 |
 | 夏令时 | 不带偏移量的本地墙上时间若在 DST 切换时**重复**（回拨）或**不存在**（前拨），请求被拒绝（422），并给出 gap 两侧 / 重复两次的绝对时间供修正；带偏移量的绝对时间（如 `...+01:00`、`...Z`）无歧义，直接通过 |
 | 无解 | 求解器返回一个足以导致矛盾的约束子集（sufficient assumption core），即“阻塞组合”，放松其中任意一项后可重新求解；**不返回部分排程** |
 
@@ -84,6 +84,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     "payment-db": 1,
     "k8s-prod-east": 2
   },
+  "resource_capacity_periods": [
+    {"resource": "k8s-prod-east", "start": "2026-11-14T01:00", "end": "2026-11-14T02:00",
+     "timezone": "UTC", "capacity": 0}
+  ],
   "max_solve_seconds": 10
 }
 ```
@@ -99,6 +103,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   同一服务在 `resources` 中重复列出同一资源也按 422 拒绝（`duplicate_resource`）。
 - 容量不满足时（如三个服务只能挤在容量 2 的同一时段）仍返回 **200、`feasible=false`**，
   `blockers` 中给出含资源容量约束的阻塞组合，不返回部分排程。
+
+`resource_capacity_periods` 为可选字段（临时限流/扩容），每项是一个容量时段：
+
+- `resource` 为资源名，`start` / `end` / `timezone` 与候选窗写法相同（墙上时间 + 时区，
+  或带偏移量的绝对时间），`capacity` 为该时段内的并行容量（**非负整数**）。
+- 时段按**左闭右开**处理：占用区间恰在时段起点结束、或恰在时段终点开始的，不受该时段限制。
+- 时段内任意时刻，同资源所有服务的部署 + 回滚占用并发数不得超过**当时容量**；
+  `capacity: 0` 表示该时段内资源完全不可占用（常用于发布前临时限流）。
+  降容时刻落在既有占用期间也须遵守——例如容量在 01:00 降为 1，则 01:00 之后
+  仍在占用中的服务也计入这 1 个名额。
+- 时段外沿用 `resource_capacities` 的基准容量；未声明基准容量的资源仍为 1。
+  时段容量高于基准容量时表示临时扩容，同样生效。
+- 同一资源的容量时段**不得重叠**（首尾相接允许），违反按 422 拒绝
+  （`capacity_period_overlap`）；容量为负数按 422 拒绝（`bad_capacity_period`）；
+  结束不晚于开始、时区未知、本地时间 DST 歧义等与候选窗相同的输入错误格式拒绝。
+- 省略该字段或传 `[]` 时，行为与旧版本完全一致。
+- 临时容量导致无解时同样返回 **200、`feasible=false`**，`blockers` 中给出对应的
+  资源阻塞组合（基准容量阻塞码为 `resource:<资源名>`，临时时段阻塞码为
+  `resource:<资源名>:<时段开始时间戳>`），不返回部分排程。
 
 时间串支持两种写法：
 
@@ -143,7 +166,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 }
 ```
 
-**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用、资源容量非正（`bad_resource_capacity`）、同一服务重复列出资源（`duplicate_resource`）等：
+**输入错误（422）**：DST 重复/不存在、未知时区、依赖环、区间非法、引用不存在的服务、候选窗短于部署+回滚占用、资源容量非正（`bad_resource_capacity`）、同一服务重复列出资源（`duplicate_resource`）、容量时段容量为负（`bad_capacity_period`）、同资源容量时段重叠（`capacity_period_overlap`）等：
 
 ```json
 {
@@ -206,6 +229,69 @@ curl -X POST http://localhost:8000/api/schedule \
 }
 ```
 
+#### 共享资源临时容量时段示例（HTTP）
+
+发布前对 `canary-pool` 临时限流：`2026-12-01 00:30 ~ 01:30 UTC` 容量降为 0（不可占用）。
+两个服务基准容量 2 本可都在 `00:00` 并行，限流后占用区间（各 1 小时）不得与该时段重叠，
+双双顺延到 `01:30` 开始：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"canary-a","name":"灰度 A","timezone":"UTC",
+       "duration_minutes":30,"rollback_minutes":30,"resources":["canary-pool"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T03:00:00Z","timezone":"UTC"}]},
+      {"id":"canary-b","name":"灰度 B","timezone":"UTC",
+       "duration_minutes":30,"rollback_minutes":30,"resources":["canary-pool"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T03:00:00Z","timezone":"UTC"}]}
+    ],
+    "resource_capacities": {"canary-pool": 2},
+    "resource_capacity_periods": [
+      {"resource":"canary-pool","start":"2026-12-01T00:30:00Z",
+       "end":"2026-12-01T01:30:00Z","timezone":"UTC","capacity":0}
+    ]
+  }'
+```
+
+返回（200，节选）：`canary-a` 与 `canary-b` 都在 `2026-12-01T01:30:00+00:00` 开始、
+占用至 `02:30` —— 限流时段 `[00:30, 01:30)` 内无任何占用，时段外仍按基准容量 2 并行。
+
+时段按左闭右开处理：若限流改为 `01:00 ~ 02:00` 容量 0，则 `00:00` 开始、`01:00` 结束占用
+的服务不受影响（占用恰在时段起点结束）。降容落在既有占用期间也须遵守：基准容量 2、
+`01:00 ~ 02:00` 降为 1 时，一个 90 分钟占用从 `00:00` 跨到 `01:30`，第二个服务必须等到
+`01:30` 才能开始（`01:00` 之后池内同时只能有 1 个占用）。
+
+限流时段覆盖全部候选窗时返回 `feasible=false`，`blockers` 含临时时段阻塞：
+
+```json
+{
+  "feasible": false,
+  "status": "infeasible",
+  "schedule": null,
+  "blockers": [
+    {"code": "resource:canary-pool:1796083200",
+     "message": "共享资源 canary-pool 在 2026-12-01T00:00:00+00:00 ~ 2026-12-01T02:00:00+00:00 UTC 期间临时限流为 0（不可占用）；涉及服务的部署+回滚窗口不得与该时段重叠: 灰度 A"}
+  ]
+}
+```
+
+同一资源的时段重叠、容量为负数均按 422 拒绝：
+
+```json
+{
+  "errors": [
+    {
+      "code": "capacity_period_overlap",
+      "field": "resource_capacity_periods[canary-pool]",
+      "message": "资源 canary-pool 的容量时段重叠：…；同一资源的容量时段不得重叠（首尾相接允许）",
+      "suggestions": null
+    }
+  ]
+}
+```
+
 ### `POST /api/schedule/diff` — 变更影响预演
 
 变更评审时，提交一份**当前排程请求**和一份**修改后的请求**，系统分别独立求解，
@@ -226,10 +312,11 @@ curl -X POST http://localhost:8000/api/schedule \
   给出变化前后的 UTC 时刻与变化分钟数（`delta_minutes` 正为推迟、负为提前；未变化的字段为 `null`）；
 - `added` / `removed`：仅在 `modified` 中出现（新增）/ 仅在 `current` 中出现（被移除）的服务；
 - 两份请求结果完全一致时，三个列表均为空（空差异）。
-- 两侧请求**各自携带自己的 `resource_capacities` 并独立求解**：例如 current 未声明容量
-  （资源串行）、modified 把同一资源声明为容量 2（两项并行），差异会体现在被提前的
-  服务上；某一侧容量非法（422）或容量导致无解时，同样只在 `failures` 的该侧给出
-  完整错误 / 阻塞组合（含资源约束），`diff` 为 `null`，不给部分排程。
+- 两侧请求**各自携带自己的 `resource_capacities` 与 `resource_capacity_periods` 并独立求解**：
+  例如 current 未声明容量（资源串行）、modified 把同一资源声明为容量 2（两项并行），
+  或 modified 新增一段临时限流时段（容量 0），差异会体现在被提前/推迟的服务上；
+  某一侧容量或容量时段非法（422）、或容量约束导致无解时，同样只在 `failures` 的
+  该侧给出完整错误 / 阻塞组合（含资源约束），`diff` 为 `null`，不给部分排程。
 - **任一请求输入错误或无解时，不输出差异结果**：在 `failures` 中按 `current` / `modified`
   分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`），
   与直接调用 `/api/schedule` 得到的内容一致。

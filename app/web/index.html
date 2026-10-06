@@ -59,6 +59,7 @@
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
       <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
+      <button class="secondary" onclick="loadScenario('throttle')">临时限流时段</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
       <button class="secondary" onclick="loadScenario('infeasible')">不可行示例</button>
     </div>
@@ -126,6 +127,24 @@ const SCENARIOS = {
     // canary-pool 容量 2：A、B 可并行占用，C 错峰一小时；
     // 改成 1 则三者串行，改成 0 会以 422（bad_resource_capacity）拒绝。
     resource_capacities: { "canary-pool": 2 },
+    dependencies: [], service_teams: [], team_blackouts: [], freezes: []
+  },
+  throttle: {
+    services: [
+      { id:"canary-a", name:"灰度服务 A", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]},
+      { id:"canary-b", name:"灰度服务 B", timezone:"UTC",
+        duration_minutes:30, rollback_minutes:30, resources:["canary-pool"],
+        windows:[{start:"2026-12-01T00:00", end:"2026-12-01T03:00", timezone:"UTC"}]}
+    ],
+    // 基准容量 2 本可都在 00:00 并行；00:30~01:30 临时限流为 0（不可占用），
+    // 两个 1 小时占用区间双双顺延到 01:30 开始。时段左闭右开：01:30 开始的占用不受限。
+    resource_capacities: { "canary-pool": 2 },
+    resource_capacity_periods: [
+      { resource:"canary-pool", start:"2026-12-01T00:30:00Z",
+        end:"2026-12-01T01:30:00Z", timezone:"UTC", capacity:0 }
+    ],
     dependencies: [], service_teams: [], team_blackouts: [], freezes: []
   },
   dst: {
